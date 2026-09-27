@@ -53,6 +53,9 @@ import {
 import {
   archiveOldStreams,
   calculateProgress,
+  compareStreams,
+  MAX_COMPARE_STREAMS,
+  MIN_COMPARE_STREAMS,
   cancelStream,
   createStream,
   getStream,
@@ -1051,6 +1054,62 @@ app.get(
     res.json({ data: paginatedData, total, page, limit });
   },
 );
+
+const compareStreamsQuerySchema = z.object({
+  ids: z
+    .string()
+    .trim()
+    .min(1, "ids must not be empty")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((id) => id.trim())
+        .filter((id) => id.length > 0),
+    )
+    .refine((ids) => ids.length >= MIN_COMPARE_STREAMS, {
+      message: `At least ${MIN_COMPARE_STREAMS} stream IDs are required.`,
+    })
+    .refine((ids) => ids.length <= MAX_COMPARE_STREAMS, {
+      message: `At most ${MAX_COMPARE_STREAMS} stream IDs are allowed.`,
+    }),
+});
+
+app.get("/api/streams/compare", readLimiter, (req: Request, res: Response) => {
+  const parsedQuery = compareStreamsQuerySchema.safeParse(req.query);
+  if (!parsedQuery.success) {
+    sendValidationError(req, res, parsedQuery.error.issues);
+    return;
+  }
+
+  const ids = parsedQuery.data.ids;
+  for (const id of ids) {
+    const parsedId = parseStreamId(id);
+    if (!parsedId.ok) {
+      sendValidationError(req, res, parsedId.issues);
+      return;
+    }
+  }
+
+  const at = nowInSeconds();
+  try {
+    const data = compareStreams(ids, at);
+    // A comparison is a snapshot: never let a shared cache serve stale values.
+    res.set("Cache-Control", "no-store");
+    res.json({ at, data });
+  } catch (error: unknown) {
+    const normalizedError = normalizeUnknownApiError(
+      error,
+      "Failed to compare streams.",
+    );
+    sendApiError(
+      req,
+      res,
+      normalizedError.statusCode,
+      normalizedError.message,
+      { code: normalizedError.code ?? "INTERNAL_ERROR" },
+    );
+  }
+});
 
 app.get("/api/streams/:id", readLimiter, (req: Request, res: Response) => {
   const parsedId = parseStreamId(req.params.id);
