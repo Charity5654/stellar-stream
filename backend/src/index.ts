@@ -43,6 +43,7 @@ import { startArchiveJob } from "./services/archiveJob";
 import { startStreamProgressBroadcaster } from "./services/streamProgressBroadcaster";
 import { startWebhookWorker } from "./services/webhookWorker";
 import { startDeadLetterPruningJob } from "./services/webhookDeadLetterPruningJob";
+import { getWebhookOutcomeSignal, refreshWebhookMetrics } from "./services/webhookMonitor";
 import {
   clearDeadLetters,
   getDeadLetters,
@@ -409,6 +410,14 @@ app.get("/metrics", async (_req: Request, res: Response) => {
       res.status(401).send("Unauthorized");
       return;
     }
+  }
+
+  // Publish the coarse webhook health signal alongside the raw counters so
+  // the scrape and GET /api/webhooks/monitoring cannot disagree.
+  try {
+    refreshWebhookMetrics();
+  } catch (error) {
+    logger.warn({ err: error }, "failed to refresh webhook monitoring metrics");
   }
 
   const output = await register.metrics();
@@ -1829,6 +1838,41 @@ app.get("/api/open-issues", async (req: Request, res: Response) => {
     );
   }
 });
+
+// GET /api/webhooks/monitoring — coarse delivery-health signal for the
+// outbound webhook pipeline. Counts and state only: it never returns the
+// destination URL, payloads, or stream IDs.
+app.get(
+  "/api/webhooks/monitoring",
+  authMiddleware,
+  (req: Request, res: Response) => {
+    try {
+      const signal = getWebhookOutcomeSignal();
+      res.set("Cache-Control", "no-store");
+      res.json({
+        outcome: signal.outcome,
+        outcomeCode: signal.outcomeCode,
+        detail: signal.detail,
+        counts: signal.counts,
+      });
+    } catch (error: any) {
+      logger.error({ err: error }, "failed to compute webhook monitoring outcome");
+      const normalizedError = normalizeUnknownApiError(
+        error,
+        "Failed to compute webhook monitoring outcome.",
+      );
+      sendApiError(
+        req,
+        res,
+        normalizedError.statusCode,
+        normalizedError.message,
+        {
+          code: normalizedError.code ?? "INTERNAL_ERROR",
+        },
+      );
+    }
+  },
+);
 
 app.get(
   "/api/webhooks/dead-letters",
