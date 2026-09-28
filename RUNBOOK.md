@@ -54,6 +54,48 @@ For initial production setup, refer to the **[Deployment Guide](DEPLOYMENT.md)**
 - All existing user sessions are invalidated.
 - Users will be prompted to re-connect their wallets and sign a new challenge.
 
+**Validation from Clean Environment:**
+To verify the rotation works without undocumented local state:
+1. Provision a fresh backend instance (or container) with the new `JWT_SECRET` only
+2. No database migration or prior state required - the secret is read at startup
+3. Issue a new challenge via `GET /api/auth/challenge` and complete auth flow
+4. Verify `POST /api/auth/token` returns a valid JWT signed with the new secret.
+
+---
+
+### Rotate Server Signing Key
+**Prerequisites:**
+- Access to the backend environment variables or `.env` file.
+- A Stellar keypair (secret key starting with `S...`)
+
+**Steps:**
+1. Generate a new Stellar keypair:
+   ```bash
+   # Using Stellar CLI
+   stellar keys generate server-signing-new
+   # Or via Node.js:
+   node -e "const {Keypair} = require('@stellar/stellar-sdk'); const kp = Keypair.random(); console.log('Secret:', kp.secret()); console.log('Public:', kp.publicKey());"
+   ```
+2. Fund the new public key on-chain with XLM for transaction fees (testnet: friendbot).
+3. Update the `SERVER_SIGNING_KEY` value in your environment or `backend/.env` file.
+4. Restart the backend service.
+
+**Expected Output:**
+- All existing SEP-10 challenges issued with the old key become invalid.
+- New challenges via `GET /api/auth/challenge` are signed with the new key.
+- Clients must request a new challenge and re-sign to authenticate.
+
+**Validation from Clean Environment:**
+To verify the rotation works without undocumented local state:
+1. Provision a fresh backend instance (or container) with the new `SERVER_SIGNING_KEY` only
+2. No database migration or prior state required - the key is read at startup
+3. Issue a new challenge via `GET /api/auth/challenge?accountId=<client>`
+4. Client signs the challenge and submits via `POST /api/auth/token`
+5. Verify a valid JWT is returned (signed with current `JWT_SECRET`)
+
+**Note on Combined Rotation:**
+Both `JWT_SECRET` and `SERVER_SIGNING_KEY` can be rotated simultaneously by updating both environment variables and restarting once. The order of operations does not matter as both are loaded at startup.
+
 ---
 
 ### Force Indexer Reconcile
