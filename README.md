@@ -220,6 +220,10 @@ Retries: 3
 
 Start Period: 10s
 
+Backend restart policy: on-failure:5 (bounded; stops after 5 crash restarts)
+
+Guarded startup: `npm run compose:up` waits for backend then frontend health, retries the backend once, and rolls back with `docker compose down` (volumes kept) if they never become healthy. See [RUNBOOK.md](RUNBOOK.md#docker-compose-startup-failure).
+
 GET /api/streams
 Purpose: List streams sorted by newest first, with optional filtering and pagination
 
