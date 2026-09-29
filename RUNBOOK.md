@@ -16,6 +16,7 @@ For initial production setup, refer to the **[Deployment Guide](DEPLOYMENT.md)**
 10. [Webhook Delivery Outcome Signal](#webhook-delivery-outcome-signal)
 11. [SQLite WAL Size Growth](#sqlite-wal-size-growth)
 12. [Contract Invocation Timeout](#contract-invocation-timeout)
+13. [Docker Compose Startup Failure](#docker-compose-startup-failure)
 
 ---
 
@@ -635,3 +636,54 @@ an explicit owner action instead of raw counters.
      jq '.result'
    ```
 6. **Escalate to the Soroban/SDK team** if the issue is on the Stellar network side (e.g., network congestion or protocol upgrade).
+
+---
+
+### Docker Compose Startup Failure
+
+**Symptom:** `docker compose up` hangs or fails with `dependency failed to start: container stellar-backend is unhealthy`, the frontend never starts, or `stellar-backend` shows `Restarting`.
+
+**Why:** the frontend has `depends_on: backend: condition: service_healthy`, so it waits on the backend healthcheck (`wget http://localhost:3001/api/health`, every 30s, 3 retries, 10s start period). If the backend exits during startup (for example, `validateEnv()` rejects the config), `restart: on-failure:5` restarts it up to 5 times. After that it stays stopped.
+
+#### Guarded startup
+
+Use the startup script instead of `docker compose up -d`. It either reaches a verified healthy state or stops with a rollback:
+
+```bash
+npm run compose:up        # or: bash scripts/compose-up.sh
+```
+
+| Phase | What happens | On failure |
+|-------|--------------|------------|
+| Preflight | Checks `docker compose`, `backend/.env`, `docker compose config` | Exit `2`. Nothing is started |
+| Backend | `up -d --build redis backend`, then polls container health every `POLL_INTERVAL`s for up to `BACKEND_HEALTH_TIMEOUT`s | Prints `compose ps`, the last healthcheck probes and the last 40 log lines |
+| Recovery | Restarts the backend at most `MAX_RECOVERY_ATTEMPTS` times (default `1`). Config errors are **not** retried. `MAX_CRASH_RESTARTS` (default `3`) container restarts count as a crash loop | Rollback |
+| Frontend | Starts only after the backend is healthy. Waits up to `FRONTEND_HEALTH_TIMEOUT`s | Rollback |
+| Rollback | `docker compose down --remove-orphans`. The `backend-data` volume (SQLite) is **kept** | Exit `1`, `RESULT: FAIL` |
+
+It ends with a single `RESULT: PASS` or `RESULT: FAIL` line. Set `ROLLBACK=keep` to leave the containers running so you can inspect them.
+
+#### Manual detection
+
+```bash
+docker compose ps                                   # STATUS: (unhealthy) / Restarting
+docker inspect -f '{{json .State.Health}}' stellar-backend | jq '.Log[-3:]'
+docker compose logs --tail 50 backend
+```
+
+#### Common causes
+
+| Log line | Fix |
+|----------|-----|
+| `env file .../backend/.env not found` | `cp backend/.env.example backend/.env` |
+| `Soroban configuration incomplete` | Set a valid `CONTRACT_ID` and `SERVER_PRIVATE_KEY`, or `SOROBAN_DISABLED=true` for local runs |
+| `must be exactly 56 characters` / `must start with` | The placeholder keys from `.env.example` are not valid. Replace them or set `SOROBAN_DISABLED=true` |
+| `EADDRINUSE` | Another process holds port 3001: `lsof -i :3001` |
+
+#### Rollback
+
+```bash
+docker compose down            # never add -v: it deletes the backend-data SQLite volume
+```
+
+After you fix the cause, re-run `npm run compose:up`. To check the script itself without Docker, run `npm run test:compose-up`.
