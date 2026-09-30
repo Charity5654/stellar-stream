@@ -91,6 +91,23 @@ const NATIVE_SENTINEL: &str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 const MAX_TEMPLATES_PER_SENDER: u32 = 10;
 
 // ---------------------------------------------------------------------------
+// Upgrade compatibility — layout version
+//
+// `STREAM_LAYOUT_VERSION` is a monotonically increasing `u32` constant that
+// encodes the current on-chain `Stream` struct layout.  Upgrade scripts and
+// migration tooling call `get_contract_version()` to compare the deployed
+// version against the version they were compiled against before touching any
+// stream records.
+//
+// Rules:
+//   • Bump the constant whenever a field is added, removed, or reordered in
+//     `Stream` OR when a `DataKey` variant is renumbered.
+//   • Never reuse a version number.
+//   • Version 1 represents the initial layout (sender … metadata).
+// ---------------------------------------------------------------------------
+pub const STREAM_LAYOUT_VERSION: u32 = 1;
+
+// ---------------------------------------------------------------------------
 // Stream struct
 // ---------------------------------------------------------------------------
 
@@ -124,6 +141,11 @@ pub struct Stream {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    /// Monotonically increasing counter for stream IDs.
+    /// Storage: **Persistent** — must survive ledger expiry so stream IDs
+    /// never collide across upgrades. (Note: some older documentation
+    /// incorrectly listed this as Instance storage; the code has always used
+    /// Persistent.)
     NextStreamId,
     Stream(u64),
     NextTemplateId,
@@ -133,6 +155,11 @@ pub enum DataKey {
     ChildToParent(u64),
     NativeToken,
     AllowedTokens,
+    /// Stores the deployed `STREAM_LAYOUT_VERSION` (`u32`).
+    /// Written by `initialize` and updated by any upgrade that changes the
+    /// `Stream` layout.  Upgrade scripts read this key via `get_contract_version`
+    /// to detect whether a migration is required before touching stream records.
+    ContractVersion,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +171,44 @@ pub enum DataKey {
 //   timestamp  – ledger close time (Unix seconds) at the moment of emission
 //
 // Additional fields carry event-specific data (amounts, addresses, etc.).
+//
+// ---------------------------------------------------------------------------
+// Stable event payload contract (upgrade compatibility)
+// ---------------------------------------------------------------------------
+//
+// The field names and types listed below form a **stable ABI**.  The backend
+// indexer (backend/src/services/indexer.ts) deserializes these fields by name
+// after calling `scValToNative`.  Any rename or type change is a breaking
+// change that requires a coordinated indexer update.
+//
+// Mandatory base fields (present on every event struct, in this order):
+//   1. stream_id  : u64
+//   2. actor      : Address
+//   3. timestamp  : u64
+//
+// Adding new optional fields to an existing struct is permitted; removing or
+// reordering existing fields is not.
+//
+// ---------------------------------------------------------------------------
+// Event emission ordering guarantee
+// ---------------------------------------------------------------------------
+//
+// Within a single transaction the contract always emits events in this order:
+//
+//   claim()
+//     1. `StreamClaimed`   — always emitted on a successful claim.
+//     2. `StreamCompleted` — emitted immediately after `StreamClaimed` in the
+//                            same transaction, only when `claimed_amount >=
+//                            total_amount` after the claim.  The indexer can
+//                            rely on `StreamClaimed` always preceding
+//                            `StreamCompleted` for the same stream in the same
+//                            ledger.
+//
+//   cancel()
+//     1. `StreamCanceled`  — emitted once after state and token transfer.
+//
+// This ordering is tested by `test_claim_event_ordering_claimed_before_completed`
+// in `src/test.rs`.
 // ---------------------------------------------------------------------------
 
 /// Emitted once when a new stream is created via `create_stream` or as a
@@ -313,6 +378,50 @@ impl StellarStreamContract {
         env.storage()
             .instance()
             .set(&DataKey::AllowedTokens, &allowed_tokens);
+        // Record the layout version so upgrade scripts can detect migrations.
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &STREAM_LAYOUT_VERSION);
+    }
+
+    /// Returns the `STREAM_LAYOUT_VERSION` that was active when `initialize`
+    /// was last called (or when the most recent layout-changing upgrade ran).
+    ///
+    /// Upgrade scripts compare this value against the constant compiled into
+    /// the new WASM to decide whether a `Stream` layout migration is needed
+    /// before any stream records are touched.  A `None` return means the
+    /// contract was deployed before this key was introduced; treat it as
+    /// version 0 and run any pending migrations.
+    pub fn get_contract_version(env: Env) -> Option<u32> {
+        env.storage().instance().get(&DataKey::ContractVersion)
+    }
+
+    /// Records the layout version after an upgrade migration completes.
+    /// Only the current admin may update it, and the version cannot decrease
+    /// or exceed the layout supported by this build.
+    pub fn set_contract_version(env: Env, admin: Address, version: u32) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("contract not initialized"));
+        if stored_admin != admin {
+            panic!("unauthorized");
+        }
+        admin.require_auth();
+
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ContractVersion)
+            .unwrap_or(0);
+        if version < current_version || version > STREAM_LAYOUT_VERSION {
+            panic!("invalid contract version");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ContractVersion, &version);
     }
 
     // -----------------------------------------------------------------------
@@ -651,6 +760,20 @@ impl StellarStreamContract {
     /// claim attempted before the interval has elapsed since the last successful
     /// claim is rejected with [`ContractError::ClaimTooFrequent`] (a
     /// `ClaimThrottled` event is emitted before the error is returned).
+    ///
+    /// # Event emission ordering guarantee
+    ///
+    /// On every successful claim this function emits events in the following
+    /// fixed order within the same transaction:
+    ///
+    ///   1. `StreamClaimed`   — always emitted after the token transfer and
+    ///                          accounting update succeed.
+    ///   2. `StreamCompleted` — emitted immediately after `StreamClaimed`,
+    ///                          **only** when `claimed_amount >= total_amount`.
+    ///
+    /// The indexer reconstructs the committed action exactly once by processing
+    /// `StreamClaimed` first.  `StreamCompleted` is a secondary signal; the
+    /// indexer must not double-count the amount from both events.
     pub fn claim(
         env: Env,
         stream_id: u64,
